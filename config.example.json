@@ -1,0 +1,28 @@
+{
+  "base_url": "https://wgmods.net",
+  "api_bootstrap_mod_id": 7438,
+  "owner_mods_endpoint": "https://wgmods.net/api/mods/?limit=12&offset=0&ordering=-rating&owner_id=239424&game_version_id=215",
+  "owner_mods_page_size": 12,
+  "owner_mods_max_pages": 100,
+  "watch_interval_seconds": 3600,
+  "database_path": "data/wgmods_stats.sqlite",
+  "debug_json_dir": "data/debug",
+  "browser": {
+    "headless": true,
+    "slow_mo_ms": 0,
+    "navigation_timeout_ms": 60000,
+    "executable_path": "",
+    "args": ["--no-sandbox", "--disable-dev-shm-usage"]
+  },
+  "discord": {
+    "stats_webhook_url": "",
+    "announcements_webhook_url": "",
+    "post_stat_changes": true,
+    "post_new_mod_announcements": true,
+    "post_changelog_announcements": true,
+    "new_mod_mention": "<@&1472909774919307286>",
+    "update_mention": "<@&1472909774919307286>",
+    "stats_username": "WGMods Statistics",
+    "announcements_username": "WGMods Updates"
+  }
+}
