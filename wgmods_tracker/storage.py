@@ -18,11 +18,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     rating REAL,
     internal_rating REAL,
     version TEXT,
-    latest_changelog_body TEXT,
-    latest_changelog_version TEXT,
-    description_text TEXT,
-    captured_at INTEGER NOT NULL,
-    raw_json TEXT
+    captured_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_mod_time ON snapshots(mod_id, captured_at);
@@ -38,6 +34,17 @@ CREATE TABLE IF NOT EXISTS mod_detail_history (
 
 CREATE INDEX IF NOT EXISTS idx_mod_detail_history_mod_time
     ON mod_detail_history(mod_id, captured_at, id);
+
+CREATE TABLE IF NOT EXISTS mod_changelog_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mod_id INTEGER NOT NULL,
+    changelog_body TEXT,
+    changelog_version TEXT,
+    captured_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_mod_changelog_history_mod_time
+    ON mod_changelog_history(mod_id, captured_at, id);
 
 CREATE TABLE IF NOT EXISTS known_mods (
     mod_id INTEGER PRIMARY KEY,
@@ -71,26 +78,44 @@ class Storage:
         existing = {row[1] for row in self.conn.execute("PRAGMA table_info(snapshots)")}
         columns = {
             "version": "TEXT",
+            "internal_rating": "REAL",
             "latest_changelog_body": "TEXT",
             "latest_changelog_version": "TEXT",
             "description_text": "TEXT",
-            "internal_rating": "REAL",
+            "raw_json": "TEXT",
         }
         for name, typ in columns.items():
             if name not in existing:
                 self.conn.execute(f"ALTER TABLE snapshots ADD COLUMN {name} {typ}")
-        if self._snapshot_raw_json_is_required():
-            self._rebuild_snapshots_table()
-            should_vacuum = True
         if self._backfill_detail_history():
             should_vacuum = True
-        self.conn.execute("PRAGMA user_version = 2")
+        if self._backfill_changelog_history():
+            should_vacuum = True
+        if self._snapshots_need_rebuild():
+            self._rebuild_snapshots_table()
+            should_vacuum = True
+        self.conn.execute("PRAGMA user_version = 4")
         return should_vacuum
 
-    def _snapshot_raw_json_is_required(self) -> bool:
-        for row in self.conn.execute("PRAGMA table_info(snapshots)"):
-            if row[1] == "raw_json":
-                return bool(row[3])
+    def _snapshots_need_rebuild(self) -> bool:
+        rows = list(self.conn.execute("PRAGMA table_info(snapshots)"))
+        columns = [row[1] for row in rows]
+        required = [
+            "id",
+            "mod_id",
+            "title",
+            "downloads",
+            "votes",
+            "rating",
+            "internal_rating",
+            "version",
+            "captured_at",
+        ]
+        if columns != required:
+            return True
+        for row in rows:
+            if row[1] == "id":
+                return not bool(row[5])
         return False
 
     def _rebuild_snapshots_table(self) -> None:
@@ -107,22 +132,14 @@ class Storage:
                 rating REAL,
                 internal_rating REAL,
                 version TEXT,
-                latest_changelog_body TEXT,
-                latest_changelog_version TEXT,
-                description_text TEXT,
-                captured_at INTEGER NOT NULL,
-                raw_json TEXT
+                captured_at INTEGER NOT NULL
             );
 
             INSERT INTO snapshots (
-                id, mod_id, title, downloads, votes, rating, internal_rating, version,
-                latest_changelog_body, latest_changelog_version, description_text,
-                captured_at, raw_json
+                id, mod_id, title, downloads, votes, rating, internal_rating, version, captured_at
             )
             SELECT
-                id, mod_id, title, downloads, votes, rating, internal_rating, version,
-                latest_changelog_body, latest_changelog_version, description_text,
-                captured_at, raw_json
+                id, mod_id, title, downloads, votes, rating, internal_rating, version, captured_at
             FROM snapshots_old;
 
             DROP TABLE snapshots_old;
@@ -151,6 +168,21 @@ class Storage:
         query += " ORDER BY captured_at DESC, id DESC LIMIT 1"
         return self.conn.execute(query, tuple(params)).fetchone()
 
+    def _latest_changelog_row(
+        self, mod_id: int, *, captured_at: int | None = None
+    ) -> sqlite3.Row | None:
+        query = """
+            SELECT changelog_body, changelog_version
+            FROM mod_changelog_history
+            WHERE mod_id = ?
+        """
+        params: list[int] = [mod_id]
+        if captured_at is not None:
+            query += " AND captured_at <= ?"
+            params.append(captured_at)
+        query += " ORDER BY captured_at DESC, id DESC LIMIT 1"
+        return self.conn.execute(query, tuple(params)).fetchone()
+
     def _insert_detail_history(
         self,
         mod_id: int,
@@ -166,6 +198,22 @@ class Storage:
             ) VALUES (?, ?, ?, ?, ?)
             """,
             (mod_id, normalized_key, raw_json, description_text, captured_at),
+        )
+
+    def _insert_changelog_history(
+        self,
+        mod_id: int,
+        changelog_body: str | None,
+        changelog_version: str | None,
+        captured_at: int,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO mod_changelog_history (
+                mod_id, changelog_body, changelog_version, captured_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (mod_id, changelog_body, changelog_version, captured_at),
         )
 
     def _materialize_raw(
@@ -238,6 +286,55 @@ class Storage:
         )
         return changed
 
+    def _backfill_changelog_history(self) -> bool:
+        rows = self.conn.execute(
+            """
+            SELECT id, mod_id, latest_changelog_body, latest_changelog_version, captured_at
+            FROM snapshots
+            WHERE latest_changelog_body IS NOT NULL OR latest_changelog_version IS NOT NULL
+            ORDER BY mod_id, captured_at, id
+            """
+        ).fetchall()
+        if not rows:
+            return False
+
+        history_rows = self.conn.execute(
+            """
+            SELECT mod_id, changelog_body, changelog_version
+            FROM mod_changelog_history
+            ORDER BY mod_id, captured_at, id
+            """
+        ).fetchall()
+        last_seen: dict[int, tuple[str | None, str | None]] = {
+            row["mod_id"]: (row["changelog_body"], row["changelog_version"])
+            for row in history_rows
+        }
+        snapshot_ids: list[tuple[None, None, int]] = []
+        changed = False
+        for row in rows:
+            body = row["latest_changelog_body"]
+            version = row["latest_changelog_version"]
+            snapshot_ids.append((None, None, row["id"]))
+            current_state = (body, version)
+            if last_seen.get(row["mod_id"]) == current_state:
+                changed = True
+                continue
+
+            self._insert_changelog_history(
+                row["mod_id"],
+                body,
+                version,
+                row["captured_at"],
+            )
+            last_seen[row["mod_id"]] = current_state
+            changed = True
+
+        self.conn.executemany(
+            "UPDATE snapshots SET latest_changelog_body = ?, latest_changelog_version = ? WHERE id = ?",
+            snapshot_ids,
+        )
+        return changed
+
     def close(self) -> None:
         self.conn.close()
 
@@ -245,6 +342,7 @@ class Storage:
         raw_json = json.dumps(snapshot.raw, ensure_ascii=False)
         normalized_key = self._normalized_raw_key(snapshot.raw)
         latest_detail = self._latest_detail_row(snapshot.mod_id)
+        latest_changelog = self._latest_changelog_row(snapshot.mod_id)
         if (
             latest_detail is None
             or latest_detail["normalized_key"] != normalized_key
@@ -257,14 +355,23 @@ class Storage:
                 snapshot.description_text,
                 snapshot.captured_at,
             )
+        if (
+            latest_changelog is None
+            or latest_changelog["changelog_body"] != snapshot.latest_changelog_body
+            or latest_changelog["changelog_version"] != snapshot.latest_changelog_version
+        ):
+            self._insert_changelog_history(
+                snapshot.mod_id,
+                snapshot.latest_changelog_body,
+                snapshot.latest_changelog_version,
+                snapshot.captured_at,
+            )
 
         self.conn.execute(
             """
             INSERT INTO snapshots (
-                mod_id, title, downloads, votes, rating, internal_rating, version,
-                latest_changelog_body, latest_changelog_version, description_text,
-                captured_at, raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                mod_id, title, downloads, votes, rating, internal_rating, version, captured_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snapshot.mod_id,
@@ -274,11 +381,7 @@ class Storage:
                 snapshot.rating,
                 snapshot.internal_rating,
                 snapshot.version,
-                snapshot.latest_changelog_body,
-                snapshot.latest_changelog_version,
-                None,
                 snapshot.captured_at,
-                None,
             ),
         )
         self.conn.commit()
@@ -290,15 +393,18 @@ class Storage:
         ).fetchone()
         if not row:
             return None
-        detail_row = None
-        if row["raw_json"] or row["description_text"]:
-            detail_row = row
-        else:
-            detail_row = self._latest_detail_row(mod_id, captured_at=row["captured_at"])
+        detail_row = self._latest_detail_row(mod_id, captured_at=row["captured_at"])
+        changelog_row = self._latest_changelog_row(mod_id, captured_at=row["captured_at"])
 
         raw = self._materialize_raw(row, detail_row)
         description_text = (
-            detail_row["description_text"] if detail_row else row["description_text"]
+            detail_row["description_text"] if detail_row else None
+        )
+        latest_changelog_body = (
+            changelog_row["changelog_body"] if changelog_row else None
+        )
+        latest_changelog_version = (
+            changelog_row["changelog_version"] if changelog_row else None
         )
         return ModSnapshot(
             mod_id=row["mod_id"],
@@ -308,8 +414,8 @@ class Storage:
             rating=row["rating"],
             internal_rating=row["internal_rating"],
             version=row["version"],
-            latest_changelog_body=row["latest_changelog_body"],
-            latest_changelog_version=row["latest_changelog_version"],
+            latest_changelog_body=latest_changelog_body,
+            latest_changelog_version=latest_changelog_version,
             description_text=description_text,
             captured_at=row["captured_at"],
             raw=raw,
